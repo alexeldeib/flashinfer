@@ -382,8 +382,9 @@ struct KernelParams {
       strideBatch = options.vStrideBatch;
     }
 
-    // Ragged layout has no batch stride; reset negative overflow to 0 for TMA descriptor.
-    if (!isPagedKv(options.mQkvLayout) && !isContiguousKv(options.mQkvLayout) && strideBatch < 0) {
+    // Ragged layouts pack all batch items into one token axis, so the TMA descriptor has a
+    // singleton batch dimension and must not inherit a synthetic stride derived from numel().
+    if (!isPagedKv(options.mQkvLayout) && !isContiguousKv(options.mQkvLayout)) {
       strideBatch = 0;
     }
 
