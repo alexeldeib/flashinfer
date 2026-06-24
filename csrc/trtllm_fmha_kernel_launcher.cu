@@ -51,6 +51,69 @@ enum class TllmPagedAttentionMode {
 // gating behind a debug flag.
 constexpr size_t kTrtllmGenSoftmaxStatsGuardBytes = 1 * 1024 * 1024;
 
+__global__ void NeutralizeEmptyKvRaggedRowsKernel(
+    uint8_t* __restrict__ out, float* __restrict__ lse, int const* __restrict__ cum_seq_lens_q,
+    int const* __restrict__ cum_seq_lens_kv, int64_t batch_size, int64_t num_qo_heads,
+    int64_t head_dim_v, int64_t output_element_bytes, int64_t lse_stride_tokens,
+    int64_t lse_stride_heads) {
+  int const batch_idx = blockIdx.x;
+  if (batch_idx >= batch_size) {
+    return;
+  }
+
+  int const q_start = cum_seq_lens_q[batch_idx];
+  int const q_end = cum_seq_lens_q[batch_idx + 1];
+  int const kv_start = cum_seq_lens_kv[batch_idx];
+  int const kv_end = cum_seq_lens_kv[batch_idx + 1];
+  if (q_end <= q_start || kv_end > kv_start) {
+    return;
+  }
+
+  int64_t const q_len = static_cast<int64_t>(q_end - q_start);
+  int64_t const out_row_bytes = num_qo_heads * head_dim_v * output_element_bytes;
+  int64_t const out_bytes = q_len * out_row_bytes;
+  uint8_t* out_row = out + static_cast<int64_t>(q_start) * out_row_bytes;
+  for (int64_t idx = threadIdx.x; idx < out_bytes; idx += blockDim.x) {
+    out_row[idx] = 0;
+  }
+
+  if (lse == nullptr) {
+    return;
+  }
+  int64_t const lse_elems = q_len * num_qo_heads;
+  for (int64_t idx = threadIdx.x; idx < lse_elems; idx += blockDim.x) {
+    int64_t const rel_token_idx = idx / num_qo_heads;
+    int64_t const head_idx = idx - rel_token_idx * num_qo_heads;
+    int64_t const token_idx = static_cast<int64_t>(q_start) + rel_token_idx;
+    lse[token_idx * lse_stride_tokens + head_idx * lse_stride_heads] = -CUDART_INF_F;
+  }
+}
+
+inline int64_t GetTllmOutputElementBytes(Data_type o_data_type) {
+  if (o_data_type == Data_type::DATA_TYPE_E2M1) {
+    return 1;
+  }
+  return static_cast<int64_t>(get_size_in_bytes(o_data_type));
+}
+
+inline void NeutralizeEmptyKvRaggedRows(void* out, float* lse, Data_type o_data_type,
+                                        int* cum_seq_lens_q, int* cum_seq_lens_kv,
+                                        int64_t batch_size, int64_t num_qo_heads,
+                                        int64_t head_dim_v, int64_t lse_stride_tokens,
+                                        int64_t lse_stride_heads, cudaStream_t stream) {
+  if (batch_size <= 0 || num_qo_heads <= 0 || head_dim_v <= 0) {
+    return;
+  }
+
+  dim3 const grid(static_cast<unsigned int>(batch_size));
+  constexpr int kThreads = 256;
+  int64_t const output_element_bytes = GetTllmOutputElementBytes(o_data_type);
+  NeutralizeEmptyKvRaggedRowsKernel<<<grid, kThreads, 0, stream>>>(
+      static_cast<uint8_t*>(out), lse, cum_seq_lens_q, cum_seq_lens_kv, batch_size, num_qo_heads,
+      head_dim_v, output_element_bytes, lse_stride_tokens, lse_stride_heads);
+  FLASHINFER_CUDA_CALL(cudaGetLastError());
+}
+
 #include <memory>
 #include <mutex>
 
@@ -692,6 +755,9 @@ void trtllm_ragged_attention_launcher(
   }
 
   fmha_runner->run(runner_params);
+  NeutralizeEmptyKvRaggedRows(out, lse, o_data_type, cum_seq_lens_q, cum_seq_lens_kv, batch_size,
+                              num_qo_heads, head_dim_v, lse_stride_tokens, lse_stride_heads,
+                              stream);
 }
 
 void trtllm_ragged_attention(

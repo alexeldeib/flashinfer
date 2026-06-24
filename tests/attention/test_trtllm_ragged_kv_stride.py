@@ -164,9 +164,7 @@ def test_trtllm_ragged_kv_positive_stride_wrap_noncausal_correctness():
     assert key_numel > 2**32
     assert key_numel % 2**32 < 2**31
 
-    cum_seq_lens_q = torch.arange(
-        0, batch_size + 1, device=device, dtype=torch.int32
-    )
+    cum_seq_lens_q = torch.arange(0, batch_size + 1, device=device, dtype=torch.int32)
     seq_lens_kv = torch.full(
         (batch_size,), max_kv_len, device=device, dtype=torch.int32
     )
@@ -259,3 +257,126 @@ def test_trtllm_ragged_kv_positive_stride_wrap_noncausal_correctness():
     assert torch.isfinite(output_trtllm).all()
     assert torch.isfinite(lse_trtllm).all()
     torch.testing.assert_close(output_trtllm, output_ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.cuda
+def test_trtllm_ragged_empty_kv_rows_are_neutral():
+    """
+    Ragged rows with query tokens but zero KV tokens must be merge-neutral.
+
+    Chunked-context callers can legally pass a row whose query segment is
+    non-empty while the row's current KV chunk is empty. Attention over that
+    row has no keys, so the output is zero and LSE is -inf.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+    if not hasattr(flashinfer.prefill, "trtllm_ragged_attention_deepseek"):
+        pytest.skip("trtllm_ragged_attention_deepseek is not available in this build")
+
+    device = torch.device("cuda")
+    compute_capability = get_compute_capability(device)
+    if compute_capability[0] != 10:
+        pytest.skip(
+            "TRTLLM-gen ragged attention requires SM100 and SM103 GPUs, "
+            f"got sm{compute_capability[0]}{compute_capability[1]}"
+        )
+
+    torch.manual_seed(42)
+
+    batch_size = 3
+    num_qo_heads = 16
+    num_kv_heads = 16
+    head_dim_qk = 128
+    head_dim_vo = 128
+    seq_lens_q = torch.tensor([4, 5, 3], device=device, dtype=torch.int32)
+    seq_lens_kv = torch.tensor([7, 0, 2], device=device, dtype=torch.int32)
+    cum_seq_lens_q = torch.cat(
+        [
+            torch.zeros(1, device=device, dtype=torch.int32),
+            torch.cumsum(seq_lens_q, dim=0, dtype=torch.int32),
+        ],
+        dim=0,
+    )
+    cum_seq_lens_kv = torch.cat(
+        [
+            torch.zeros(1, device=device, dtype=torch.int32),
+            torch.cumsum(seq_lens_kv, dim=0, dtype=torch.int32),
+        ],
+        dim=0,
+    )
+    total_q = int(cum_seq_lens_q[-1].item())
+    total_kv = int(cum_seq_lens_kv[-1].item())
+    max_q_len = int(seq_lens_q.max().item())
+    max_kv_len = int(seq_lens_kv.max().item())
+
+    q = torch.randn(
+        total_q,
+        num_qo_heads,
+        head_dim_qk,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    k = torch.randn(
+        total_kv,
+        num_kv_heads,
+        head_dim_qk,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    v = torch.randn(
+        total_kv,
+        num_kv_heads,
+        head_dim_vo,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+
+    out = torch.full(
+        (total_q, num_qo_heads, head_dim_vo),
+        7.0,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    lse = torch.full(
+        (total_q, num_qo_heads),
+        3.0,
+        device=device,
+        dtype=torch.float32,
+    )
+    workspace_buffer = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+    scale = float(1.0 / (head_dim_qk**0.5))
+
+    output_trtllm, lse_trtllm = flashinfer.prefill.trtllm_ragged_attention_deepseek(
+        query=q,
+        key=k,
+        value=v,
+        workspace_buffer=workspace_buffer,
+        seq_lens=seq_lens_kv,
+        max_q_len=max_q_len,
+        max_kv_len=max_kv_len,
+        bmm1_scale=scale,
+        bmm2_scale=1.0,
+        o_sf_scale=1.0,
+        batch_size=batch_size,
+        window_left=-1,
+        cum_seq_lens_q=cum_seq_lens_q,
+        cum_seq_lens_kv=cum_seq_lens_kv,
+        enable_pdl=False,
+        is_causal=False,
+        return_lse=True,
+        out=out,
+        lse=lse,
+    )
+
+    empty_q_start = int(cum_seq_lens_q[1].item())
+    empty_q_end = int(cum_seq_lens_q[2].item())
+    assert output_trtllm.data_ptr() == out.data_ptr()
+    assert lse_trtllm.data_ptr() == lse.data_ptr()
+    assert torch.all(output_trtllm[empty_q_start:empty_q_end] == 0)
+    assert torch.isneginf(lse_trtllm[empty_q_start:empty_q_end]).all()
+
+    nonempty_lse = torch.cat(
+        [lse_trtllm[:empty_q_start], lse_trtllm[empty_q_end:]], dim=0
+    )
+    assert torch.isfinite(nonempty_lse).all()
